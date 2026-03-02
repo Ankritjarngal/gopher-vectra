@@ -1,0 +1,3 @@
+*.wal
+*.db
+gopher.index
