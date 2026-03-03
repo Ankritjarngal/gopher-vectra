@@ -16,6 +16,7 @@ type Node struct {
 	ID        uint32
 	Vector    *vector.Vector
 	Neighbors [][]uint32
+	Deleted   bool
 }
 
 type HNSW struct {
@@ -52,6 +53,15 @@ func (h *HNSW) RandomLevel() int {
 	return level
 }
 
+func (h *HNSW) IsDeleted(id uint32) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if node, ok := h.Nodes[id]; ok {
+		return node.Deleted
+	}
+	return true
+}
+
 func (h *HNSW) Insert(v *vector.Vector) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -63,6 +73,7 @@ func (h *HNSW) Insert(v *vector.Vector) error {
 		ID:        nodeID,
 		Vector:    v,
 		Neighbors: make([][]uint32, targetLevel+1),
+		Deleted:   false,
 	}
 
 	for i := 0; i <= targetLevel; i++ {
@@ -79,18 +90,24 @@ func (h *HNSW) Insert(v *vector.Vector) error {
 
 	currObj := h.EntryNode
 	for l := h.CurrentMax; l > targetLevel; l-- {
-		currObj = h.searchLayer(v.Values, currObj, 1, l)[0]
+		res := h.internalSearchLayer(v.Values, currObj, 1, l)
+		if len(res) > 0 {
+			currObj = res[0]
+		}
 	}
 
 	for l := minInt(targetLevel, h.CurrentMax); l >= 0; l-- {
-		neighbors := h.searchLayer(v.Values, currObj, h.M, l)
+		neighbors := h.internalSearchLayer(v.Values, currObj, h.M, l)
 
 		for _, neighborID := range neighbors {
 			newNode.Neighbors[l] = append(newNode.Neighbors[l], neighborID)
-			neighborNode := h.Nodes[neighborID]
-			neighborNode.Neighbors[l] = append(neighborNode.Neighbors[l], nodeID)
+			if neighborNode, ok := h.Nodes[neighborID]; ok {
+				neighborNode.Neighbors[l] = append(neighborNode.Neighbors[l], nodeID)
+			}
 		}
-		currObj = neighbors[0]
+		if len(neighbors) > 0 {
+			currObj = neighbors[0]
+		}
 	}
 
 	if targetLevel > h.CurrentMax {
@@ -101,7 +118,7 @@ func (h *HNSW) Insert(v *vector.Vector) error {
 	return nil
 }
 
-func (h *HNSW) searchLayer(target []float32, entryNode uint32, ef int, level int) []uint32 {
+func (h *HNSW) internalSearchLayer(target []float32, entryNode uint32, ef int, level int) []uint32 {
 	visited := map[uint32]bool{entryNode: true}
 	candidates := []uint32{entryNode}
 	foundNeighbors := []uint32{entryNode}
@@ -109,19 +126,30 @@ func (h *HNSW) searchLayer(target []float32, entryNode uint32, ef int, level int
 	for len(candidates) > 0 {
 		currID := candidates[0]
 		candidates = candidates[1:]
-		currNode := h.Nodes[currID]
+
+		currNode, ok := h.Nodes[currID]
+		if !ok {
+			continue
+		}
 
 		for _, neighborID := range currNode.Neighbors[level] {
 			if !visited[neighborID] {
 				visited[neighborID] = true
-				foundNeighbors = append(foundNeighbors, neighborID)
-				candidates = append(candidates, neighborID)
+				if _, exists := h.Nodes[neighborID]; exists {
+					foundNeighbors = append(foundNeighbors, neighborID)
+					candidates = append(candidates, neighborID)
+				}
 			}
 		}
 
 		sort.Slice(foundNeighbors, func(i, j int) bool {
-			simI, _ := vector.CosineSimilarity(target, h.Nodes[foundNeighbors[i]].Vector.Values)
-			simJ, _ := vector.CosineSimilarity(target, h.Nodes[foundNeighbors[j]].Vector.Values)
+			nodeI := h.Nodes[foundNeighbors[i]]
+			nodeJ := h.Nodes[foundNeighbors[j]]
+			if nodeI == nil || nodeJ == nil {
+				return false
+			}
+			simI, _ := vector.CosineSimilarity(target, nodeI.Vector.Values)
+			simJ, _ := vector.CosineSimilarity(target, nodeJ.Vector.Values)
 			return simI > simJ
 		})
 
@@ -142,13 +170,22 @@ func (h *HNSW) Search(query []float32, k int) []*vector.Vector {
 
 	currObj := h.EntryNode
 	for l := h.CurrentMax; l > 0; l-- {
-		currObj = h.searchLayer(query, currObj, 1, l)[0]
+		res := h.internalSearchLayer(query, currObj, 1, l)
+		if len(res) > 0 {
+			currObj = res[0]
+		}
 	}
 
-	resultIDs := h.searchLayer(query, currObj, k, 0)
+	resultIDs := h.internalSearchLayer(query, currObj, h.Ef, 0)
 	results := make([]*vector.Vector, 0, len(resultIDs))
 	for _, id := range resultIDs {
-		results = append(results, h.Nodes[id].Vector)
+		node := h.Nodes[id]
+		if node != nil && !node.Deleted {
+			results = append(results, node.Vector)
+		}
+		if len(results) >= k {
+			break
+		}
 	}
 	return results
 }
@@ -171,6 +208,7 @@ func (h *HNSW) Save(path string) error {
 		node := h.Nodes[i]
 		layerCount := uint32(len(node.Neighbors))
 		binary.Write(f, binary.LittleEndian, layerCount)
+		binary.Write(f, binary.LittleEndian, node.Deleted)
 
 		for l := 0; l < int(layerCount); l++ {
 			neighborCount := uint32(len(node.Neighbors[l]))
@@ -206,11 +244,15 @@ func (h *HNSW) Load(path string) error {
 		var layerCount uint32
 		binary.Read(f, binary.LittleEndian, &layerCount)
 
+		var isDeleted bool
+		binary.Read(f, binary.LittleEndian, &isDeleted)
+
 		node, exists := h.Nodes[i]
 		if !exists {
-			return fmt.Errorf("node %d not found in memory during load", i)
+			return fmt.Errorf("node %d not found in memory", i)
 		}
 
+		node.Deleted = isDeleted
 		node.Neighbors = make([][]uint32, layerCount)
 		for l := 0; l < int(layerCount); l++ {
 			var neighborCount uint32
@@ -230,10 +272,12 @@ func minInt(a, b int) int {
 	return b
 }
 
-func(h * HNSW) Delete(id uint32){
+func (h *HNSW) Delete(id uint32) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	delete(h.Nodes,id)
+	if node, ok := h.Nodes[id]; ok {
+		node.Deleted = true
+	}
 }
 
 func (h *HNSW) FindInternalID(stringID string) (uint32, bool) {
@@ -241,7 +285,7 @@ func (h *HNSW) FindInternalID(stringID string) (uint32, bool) {
 	defer h.mu.RUnlock()
 
 	for id, node := range h.Nodes {
-		if node.Vector.ID == stringID {
+		if node.Vector.ID == stringID && !node.Deleted {
 			return id, true
 		}
 	}
@@ -254,16 +298,19 @@ func (h *HNSW) BruteForceSearch(query []float32, k int) []*Node {
 
 	type distanceResult struct {
 		node *Node
-		dist float32 
+		dist float32
 	}
 
 	var allDistances []distanceResult
 
 	for _, node := range h.Nodes {
+		if node.Deleted {
+			continue
+		}
 		sim, _ := vector.CosineSimilarity(query, node.Vector.Values)
-				allDistances = append(allDistances, distanceResult{
+		allDistances = append(allDistances, distanceResult{
 			node: node,
-			dist: float32(sim), 
+			dist: float32(sim),
 		})
 	}
 

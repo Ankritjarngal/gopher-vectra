@@ -1,50 +1,61 @@
 package storage
 
-
-import(
+import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 
+	"github.com/Ankritjarngal/gopher-vectra/pkg/bloom"
 	"github.com/Ankritjarngal/gopher-vectra/pkg/vector"
 )
 
-type SSTable struct{
+var ActiveFilters = make(map[string]*bloom.Filter)
+
+type SSTable struct {
 	Path string
 }
 
-func Flush(entries map[string]*vector.Vector,path string)(*SSTable,error){
-	ids:=make([]string,0,len(entries))
-	for id:=range entries{
-		ids=append(ids,id)
+func Flush(entries map[string]*vector.Vector, path string) (*SSTable, error) {
+	ids := make([]string, 0, len(entries))
+	for id := range entries {
+		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	f,err:=os.Create(path)
-	if err!=nil{
-		return nil,err
+
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
 	}
 	defer f.Close()
+
+	bf := bloom.New(100, 0.01)
+
 	for _, id := range ids {
-		v := entries[id]		
+		v := entries[id]
+		bf.Add(id)
+
 		idBytes := []byte(v.ID)
-		if err := binary.Write(f, binary.LittleEndian, uint32(len(idBytes))); err != nil {
-			return nil, err
+		binary.Write(f, binary.LittleEndian, uint32(len(idBytes)))
+		f.Write(idBytes)
+
+		isTombstone := uint8(0)
+		if v.Metadata != nil {
+			if _, deleted := v.Metadata["tombstone"]; deleted {
+				isTombstone = 1
+			}
 		}
-		if _, err := f.Write(idBytes); err != nil {
-			return nil, err
-		}
-		if err := binary.Write(f, binary.LittleEndian, uint32(len(v.Values))); err != nil {
-			return nil, err
-		}
-		if err := binary.Write(f, binary.LittleEndian, v.Values); err != nil {
-			return nil, err
-		}
+		binary.Write(f, binary.LittleEndian, isTombstone)
+
+		binary.Write(f, binary.LittleEndian, uint32(len(v.Values)))
+		binary.Write(f, binary.LittleEndian, v.Values)
 	}
+	ActiveFilters[filepath.Base(path)] = bf
 
-	fmt.Printf("Successfully flushed %d vectors to %s\n", len(entries), path)
+	fmt.Printf("Successfully flushed %d vectors and created Bloom Filter for %s\n", len(entries), path)
 	return &SSTable{Path: path}, nil
-
 }
 
 func LoadSSTable(path string) (map[string]*vector.Vector, error) {
@@ -58,122 +69,123 @@ func LoadSSTable(path string) (map[string]*vector.Vector, error) {
 	fileInfo, _ := f.Stat()
 	size := fileInfo.Size()
 
+	bf := bloom.New(100, 0.01)
+
 	var offset int64 = 0
 	for offset < size {
 		var idLen uint32
 		if err := binary.Read(f, binary.LittleEndian, &idLen); err != nil {
-			break 
+			break
 		}
-
 		idBytes := make([]byte, idLen)
-		if _, err := f.Read(idBytes); err != nil {
-			return nil, err
-		}
+		f.Read(idBytes)
 		id := string(idBytes)
 
+		var isTombstone uint8
+		binary.Read(f, binary.LittleEndian, &isTombstone)
+
 		var vecLen uint32
-		if err := binary.Read(f, binary.LittleEndian, &vecLen); err != nil {
-			return nil, err
-		}
-
+		binary.Read(f, binary.LittleEndian, &vecLen)
 		values := make([]float32, vecLen)
-		if err := binary.Read(f, binary.LittleEndian, &values); err != nil {
-			return nil, err
+		binary.Read(f, binary.LittleEndian, &values)
+
+		v := &vector.Vector{ID: id, Values: values}
+		if isTombstone == 1 {
+			v.Metadata = map[string]string{"tombstone": "true"}
 		}
 
-		entries[id] = &vector.Vector{
-			ID:     id,
-			Values: values,
-		}
+		entries[id] = v
+		bf.Add(id)
 		offset, _ = f.Seek(0, 1)
 	}
 
+	ActiveFilters[filepath.Base(path)] = bf
 	return entries, nil
 }
 
+func ExistOnDisk(id string) bool {
+	files, _ := os.ReadDir(".")
+	for _, f := range files {
+		if !f.IsDir() && strings.HasPrefix(f.Name(), "L") && filepath.Ext(f.Name()) == ".db" {
+			bf, exists := ActiveFilters[f.Name()]
+			if exists && bf.MightContain(id) {
+				entries, _ := LoadSSTable(f.Name())
+				if vec, found := entries[id]; found {
+					if vec.Metadata != nil {
+						if _, deleted := vec.Metadata["tombstone"]; deleted {
+							return false
+						}
+					}
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func SearchSSTable(filename string, query []float32, k int) ([]*vector.Vector, error) {
-    f, err := os.Open(filename)
-    if err != nil {
-        return nil, err // File might not exist yet, that's okay
-    }
-    defer f.Close()
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
 
-    var results []*vector.Vector
-    fileInfo, _ := f.Stat()
-    size := fileInfo.Size()
+	var results []*vector.Vector
+	fileInfo, _ := f.Stat()
+	size := fileInfo.Size()
 
-    var offset int64 = 0
-    // Binary loop reading exactly like LoadSSTable
-    for offset < size {
-        var idLen uint32
-        if err := binary.Read(f, binary.LittleEndian, &idLen); err != nil {
-            break 
-        }
+	var offset int64 = 0
+	for offset < size {
+		var idLen uint32
+		if err := binary.Read(f, binary.LittleEndian, &idLen); err != nil {
+			break
+		}
+		idBytes := make([]byte, idLen)
+		f.Read(idBytes)
+		id := string(idBytes)
 
-        idBytes := make([]byte, idLen)
-        if _, err := f.Read(idBytes); err != nil {
-            break
-        }
-        id := string(idBytes)
+		var isTombstone uint8
+		binary.Read(f, binary.LittleEndian, &isTombstone)
 
-        var vecLen uint32
-        if err := binary.Read(f, binary.LittleEndian, &vecLen); err != nil {
-            break
-        }
+		var vecLen uint32
+		binary.Read(f, binary.LittleEndian, &vecLen)
+		values := make([]float32, vecLen)
+		binary.Read(f, binary.LittleEndian, &values)
 
-        values := make([]float32, vecLen)
-        if err := binary.Read(f, binary.LittleEndian, &values); err != nil {
-            break
-        }
+		if isTombstone == 1 {
+			offset, _ = f.Seek(0, 1)
+			continue
+		}
 
-        // Calculate similarity for this specific vector
-        sim, _ := vector.CosineSimilarity(query, values)
-        
-        // Create the vector object with the score populated
-        v := &vector.Vector{
-            ID:     id,
-            Values: values,
-            Score:  sim,
-        }
-        results = append(results, v)
-        
-        offset, _ = f.Seek(0, 1) // Advance offset tracker
-    }
+		sim, _ := vector.CosineSimilarity(query, values)
+		results = append(results, &vector.Vector{
+			ID:     id,
+			Values: values,
+			Score:  sim,
+		})
+		offset, _ = f.Seek(0, 1)
+	}
 
-    // Sort the results from this specific file (Highest score first)
-    sort.Slice(results, func(i, j int) bool {
-        return results[i].Score > results[j].Score
-    })
-
-    // Trim to K if necessary
-    if len(results) > k {
-        return results[:k], nil
-    }
-    return results, nil
+	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
+	if len(results) > k {
+		return results[:k], nil
+	}
+	return results, nil
 }
 
 func SearchAllDiskLevels(query []float32, k int) []*vector.Vector {
 	files, _ := os.ReadDir(".")
-	var dbFiles []string
-	for _, f := range files {
-		if !f.IsDir() && (len(f.Name()) > 3 && f.Name()[len(f.Name())-3:] == ".db") {
-			dbFiles = append(dbFiles, f.Name())
-		}
-	}
-
 	var allDiskResults []*vector.Vector
-
-	for _, filename := range dbFiles {
-		results, err := SearchSSTable(filename, query, k)
-		if err == nil {
-			allDiskResults = append(allDiskResults, results...)
+	for _, f := range files {
+		if !f.IsDir() && strings.HasPrefix(f.Name(), "L") && filepath.Ext(f.Name()) == ".db" {
+			results, err := SearchSSTable(f.Name(), query, k)
+			if err == nil {
+				allDiskResults = append(allDiskResults, results...)
+			}
 		}
 	}
-
-	sort.Slice(allDiskResults, func(i, j int) bool {
-		return allDiskResults[i].Score > allDiskResults[j].Score
-	})
-
+	sort.Slice(allDiskResults, func(i, j int) bool { return allDiskResults[i].Score > allDiskResults[j].Score })
 	if len(allDiskResults) > k {
 		return allDiskResults[:k]
 	}

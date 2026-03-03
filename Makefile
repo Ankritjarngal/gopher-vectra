@@ -5,7 +5,7 @@ test-brute:
 	python3 scripts/testing_brute_meathod.py
 
 clean:
-	rm -f *.wal *.index level*.db
+	rm -f *.wal *.index *.db
 	@echo "Database wiped."
 
 status:

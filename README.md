@@ -8,45 +8,57 @@ The engine is designed around two distinct, non-overlapping responsibilities: a 
 
 ## System Architecture
 
-The following diagram illustrates the data flow from the API into the dual storage and indexing systems:
 ```mermaid
 graph TD
     A[Client Request] --> B{API Handler}
+
     B -->|POST /upsert| C[Normalization Engine]
-    C --> D[Write Ahead Log - WAL]
-    C --> E[Memtable - RAM]
-    E -->|If Limit Reached| F[Flush to SSTable - Level 0]
+    C --> D[Write-Ahead Log WAL]
+    C --> E[Memtable - RAM Buffer]
+    E -->|Threshold Reached| F[SSTable Flush - Level 0]
     F --> G[Background Compactor]
-    G -->|Merge 10x L0| H[SSTable - Level 1]
+    G -->|8x L0 files| H[SSTable - Level 1]
+    G -->|15x L1 files| I[SSTable - Level 2]
+    C --> J[HNSW Indexer]
+    J --> K[RAM Search Index]
+    K -->|SIGTERM| L[gopher.index]
 
-    C --> I[HNSW Indexer]
-    I -->|Build Graph| J[RAM Search Index]
-    J -->|SIGTERM| K[gopher.index File]
-
-    B -->|POST /search| J
+    B -->|POST /search| M{Search Mode}
+    M -->|default| K
+    M -->|?method=brute| N[Flat Cosine Scan]
+    K --> O[Merge + Rank Results]
+    N --> O
+    P[Disk SSTables] --> O
 ```
 
 ---
 
 ## Project Structure
-```plaintext
+
+```
 .
-├── main.go                 # Entry point, HTTP handlers, and graceful shutdown
-├── go.mod                  # Module dependencies
+├── main.go                        # Entry point, HTTP handlers, graceful shutdown
+├── Makefile                       # Dev commands: run, test, clean, status
+├── go.mod
 ├── internal/
-│   ├── engine/             # HNSW graph construction, node management, and search traversal
-│   │   ├── hnsw.go
+│   ├── engine/
+│   │   ├── hnsw.go                # HNSW graph: insert, search, delete, persistence
 │   │   └── persistence.go
-│   └── storage/            # LSM-Tree: WAL, Memtable, SSTable, and background Compactor
-│       ├── wal.go
-│       ├── memtable.go
-│       ├── sstable.go
-│       └── compactor.go
+│   └── storage/
+│       ├── wal.go                 # Write-Ahead Log: append, replay, crash recovery
+│       ├── memtable.go            # In-RAM write buffer with RWMutex
+│       ├── sstable.go             # SSTable flush, load, and disk search
+│       └── compactor.go          # Background multi-level compaction goroutine
 ├── pkg/
-│   └── vector/             # Vector math, cosine distance, and shared type definitions
-│       ├── distance.go
-│       └── types.go
-└── scripts/                # Python scripts for bulk ingestion and validation
+│   ├── vector/
+│   │   ├── types.go               # Vector struct and shared definitions
+│   │   └── distance.go            # Normalization and cosine similarity
+│   └── bloom/
+│       └── filter.go              # Double-hashing Bloom filter for disk lookup
+├── api/
+│   ├── server.go                  # HTTP handler struct bound to HNSW + WAL
+│   └── types.go                   # Request / response DTO definitions
+└── scripts/                       # Python bulk ingestion and recall validation
 ```
 
 ---
@@ -55,216 +67,290 @@ graph TD
 
 ### 1. The Write Path: LSM-Tree
 
-Traditional relational databases like MySQL use a B-Tree for storage, which requires random disk seeks to update records in place. GopherVectra instead uses an **LSM-Tree (Log-Structured Merge-Tree)**, which converts all random writes into fast, sequential disk operations. This is the same fundamental design used by LevelDB, RocksDB, and Apache Cassandra.
+Traditional databases use a B-Tree for storage, which requires random disk seeks to update records in place. GopherVectra uses an **LSM-Tree (Log-Structured Merge-Tree)**, converting all random writes into fast, sequential disk operations — the same design used by LevelDB, RocksDB, and Apache Cassandra.
 
-**Step 1 — Normalization Engine**
+```
+Write Request
+     │
+     ▼
+┌─────────────────────┐
+│  Normalization      │  Scale vector to unit sphere (magnitude = 1.0)
+└────────┬────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│  Write-Ahead Log    │  Append to gopher.wal before anything else
+└────────┬────────────┘
+         │
+         ├──────────────────────────────────┐
+         ▼                                  ▼
+┌─────────────────────┐          ┌─────────────────────┐
+│  Memtable (RAM)     │          │  HNSW Graph (RAM)   │
+│  50-vector buffer   │          │  Probabilistic index│
+└────────┬────────────┘          └─────────────────────┘
+         │ full?
+         ▼
+┌─────────────────────┐
+│  SSTable Flush      │  Sorted binary .db file on disk
+└─────────────────────┘
+```
 
-Before a vector ever touches disk or the graph, it passes through the normalization layer in `pkg/vector/distance.go`. The engine calculates the vector's magnitude across all 768 dimensions and scales each component so the resulting length is exactly 1.0, placing it on a unit sphere.
+**Step 1 — Normalization**
 
-This is not cosmetic. By normalizing first, every distance calculation in the HNSW graph is comparing the *angle* between two vectors rather than their raw magnitude. Cosine similarity, which measures semantic closeness, becomes mathematically equivalent to a simple dot product on unit vectors — cheaper to compute and consistent regardless of how the original embeddings were scaled.
+Before a vector touches disk or the graph, `pkg/vector/distance.go` computes the magnitude across all dimensions and scales every component so the resulting length is exactly 1.0, placing the vector on a unit sphere. After normalization, cosine similarity is mathematically equivalent to a dot product — cheaper and consistent regardless of original embedding scale.
 
 **Step 2 — Write-Ahead Log (WAL)**
 
-RAM is volatile. Before the vector is inserted into the in-memory buffer, it is immediately appended to `gopher.wal` on disk. This is a "safety first" operation: if the process crashes before the Memtable is flushed, the WAL guarantees no data is lost. On the next startup, the engine scans the WAL and replays every entry to reconstruct state.
+Before any in-memory operation, the vector is appended to `gopher.wal`. Each entry is binary-encoded with the following frame layout:
 
-**Step 3 — Memtable (Active Write Buffer)**
+```
+┌──────────┬────────────┬──────────┬──────────────────┬──────────┬───────────────┐
+│  idLen   │  id bytes  │  dimLen  │  float32 values  │ metaLen  │  meta JSON    │
+│ uint32   │  []byte    │ uint32   │  []float32       │ uint32   │  []byte       │
+└──────────┴────────────┴──────────┴──────────────────┴──────────┴───────────────┘
+```
 
-After the WAL write, the vector is inserted into the Memtable: a thread-safe Go map protected by a `sync.RWMutex`. This serves as the hot, in-RAM buffer for the most recently written data and allows for instant lookup of entries that have not yet been flushed to disk.
+On startup, the WAL is replayed in full to reconstruct any state lost in a crash. Metadata (including tombstone markers) is preserved across the WAL boundary via JSON encoding.
+
+**Step 3 — Memtable**
+
+After the WAL write, the vector enters the Memtable: a `sync.RWMutex`-protected Go map that serves as the hot in-RAM buffer. Once the Memtable reaches 50 vectors, it triggers a flush.
 
 **Step 4 — SSTable Flush**
 
-Once the Memtable reaches the configured threshold (50 vectors), it is flushed. The Go map is sorted by vector ID and written sequentially into an immutable binary `.db` file on disk — this is an **SSTable (Sorted String Table)**. Once written, these files are never modified. All updates and deletes are handled as new entries, with conflicts resolved during compaction.
+The Memtable is sorted by vector ID and written sequentially to an immutable binary `.db` file (a **Sorted String Table**). Each entry encodes its ID length, a tombstone flag, the vector dimension count, and the raw float32 values. Once written, SSTables are never modified — all updates and deletes arrive as new entries.
 
 ---
 
-### 2. The Maintenance Layer: Background Compaction
+### 2. Bloom Filters for Disk Lookup
 
-Under sustained write load, the system would accumulate hundreds of small Level 0 `.db` files. This is problematic: the OS enforces a hard limit on open file descriptors per process, and scanning many small files for a read is far slower than scanning one large one.
+Every SSTable on disk is paired with an in-memory **Bloom filter** (`pkg/bloom/filter.go`). Before scanning any `.db` file, the engine queries the filter to determine whether a given ID could possibly exist in that file. If the filter says no, the file is skipped entirely with zero disk I/O.
 
-**The Compactor Goroutine**
+```
+Lookup: "vec_42"
+    │
+    ▼
+┌──────────────────────────────┐
+│  Bloom Filter (in RAM)       │
+│  MightContain("vec_42")?     │
+└────────┬─────────────────────┘
+         │
+    No ──┘──── Skip file entirely (zero disk I/O)
+         │
+    Yes ─▼──── Open .db file and scan
+```
 
-A background goroutine runs on a 10-second tick. It scans the working directory and counts the number of Level 0 SSTable files.
+The filter uses **double hashing** (FNV-64a split into two 32-bit values) with `k` hash functions derived from the target false-positive rate `p` and expected element count `n`:
 
-**Merge-Sort and Deduplication**
+```
+m = -n * ln(p) / ln(2)^2    (bit array size)
+k =  m / n * ln(2)          (number of hash functions)
+```
 
-When 10 or more Level 0 files are detected, the Compactor reads all of them into memory, performs a merge-sort keyed on vector ID, and deduplicates — keeping only the most recently written version of any given ID. The result is written as a single, larger **Level 1** SSTable. The original Level 0 files are then deleted. This is the self-healing property of the engine: it continuously converges toward an optimal storage layout without any external intervention.
+Bloom filters are rebuilt on SSTable load and kept in the package-level `ActiveFilters` map keyed by filename, so they survive across compaction cycles.
 
 ---
 
-### 3. The Search Path: HNSW Graph
+### 3. The Maintenance Layer: Multi-Level Compaction
 
-Storing data is straightforward. Finding the closest vector in 768-dimensional space across millions of entries — in milliseconds — is the hard part. GopherVectra solves this with **HNSW (Hierarchical Navigable Small World)**, a graph-based approximate nearest neighbor algorithm implemented in `internal/engine/hnsw.go`.
+Under sustained write load, Level 0 accumulates many small `.db` files. Scanning many small files is slower than one large file, and the OS enforces hard limits on open file descriptors. The background Compactor (`internal/storage/compactor.go`) solves this automatically on a 10-second tick.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> ScanDirectory : 10s tick
+    ScanDirectory --> CountL0 : count L0_ files
+    CountL0 --> CompactL0 : >= 8 files
+    CountL0 --> CountL1 : < 8 files
+    CompactL0 --> WriteL1 : merge + deduplicate + strip tombstones
+    WriteL1 --> DeleteL0Files
+    DeleteL0Files --> CountL1
+    CountL1 --> CompactL1 : >= 15 files
+    CountL1 --> Idle : < 15 files
+    CompactL1 --> WriteL2 : merge + deduplicate + strip tombstones
+    WriteL2 --> DeleteL1Files
+    DeleteL1Files --> Idle
+```
+
+**Compaction steps:**
+
+1. All Level N files are loaded into memory.
+2. Maps are merged — later writes overwrite earlier ones for the same ID (last-write-wins).
+3. Tombstoned entries are stripped from the merged map before writing.
+4. The result is written as a single Level N+1 SSTable.
+5. All Level N source files and their Bloom filters are deleted from `ActiveFilters`.
+
+This is the self-healing property of the engine: it continuously converges toward an optimal storage layout without external intervention.
+
+---
+
+### 4. The Search Path: HNSW Graph
+
+Finding the nearest vector in 768-dimensional space across millions of entries — in milliseconds — is solved by **HNSW (Hierarchical Navigable Small World)**, implemented in `internal/engine/hnsw.go`.
 
 **Probabilistic Layer Assignment**
 
-When a vector is inserted into the graph, the engine samples from an exponential probability distribution to determine how many layers the node should occupy.
+When a vector is inserted, the engine samples from an exponential distribution to determine its maximum layer:
 
-- **Layer 0** contains every single vector in the dataset.
-- **Layer 1, 2, 3...** contain exponentially fewer vectors, acting as high-speed express lanes through the graph.
+```
+level = floor(-ln(rand()) * ML)     where ML = 1 / ln(M)
+```
 
-A vector assigned to Layer 3, for example, also exists in Layers 2, 1, and 0. Most vectors only live in Layer 0.
+```
+Layer 3  ──●──────────────────────●──          (very sparse, express lane)
+Layer 2  ──●────────●─────────────●──●──
+Layer 1  ──●──●─────●──●──────────●──●──●──
+Layer 0  ──●──●──●──●──●──●──●──●──●──●──●──  (every vector)
+```
+
+Most vectors live only in Layer 0. A node at Layer 3 also exists in Layers 2, 1, and 0 — forming a navigable hierarchy.
 
 **Search Traversal**
 
-A query enters at the topmost layer, where the graph is sparse and nodes are far apart. The algorithm greedily navigates toward the query vector by always moving to whichever neighbor reduces the distance the most. When it can no longer improve at that layer, it drops down to the next denser layer and repeats. By the time traversal reaches Layer 0, the search has been guided to the correct neighborhood of the graph without ever scanning the full dataset.
+```mermaid
+flowchart TD
+    A[Query enters at top layer] --> B[Greedy walk: move to closest neighbor]
+    B --> C{Improvement possible?}
+    C -->|Yes| B
+    C -->|No| D[Drop one layer down]
+    D --> E{At Layer 0?}
+    E -->|No| B
+    E -->|Yes| F[Collect ef nearest candidates]
+    F --> G[Return top-k results]
+```
 
-This hierarchy reduces search complexity from $O(N)$ — a brute-force full scan — to $O(\log N)$.
+This hierarchy reduces search complexity from $O(N)$ (brute-force) to $O(\log N)$.
+
+**Unified Search: RAM + Disk**
+
+The `/search` endpoint queries both the HNSW graph (RAM) and all SSTables on disk, then merges and re-ranks by cosine score before returning the top-k:
+
+```
+Query Vector
+     │
+     ├──────────────────────────────────┐
+     ▼                                  ▼
+┌─────────────┐                ┌──────────────────┐
+│ HNSW Search │                │ SSTable Search   │
+│ (RAM index) │                │ (all .db files)  │
+└──────┬──────┘                └────────┬─────────┘
+       │                                │
+       └──────────────┬─────────────────┘
+                      ▼
+             ┌─────────────────┐
+             │  Deduplicate    │
+             │  Re-rank scores │
+             │  Return top-k   │
+             └─────────────────┘
+```
 
 ---
 
-### 4. Persistence and Crash Recovery
+### 5. Persistence and Crash Recovery
 
-A database that loses its index on every restart is unusable in production. GopherVectra handles durability through two complementary mechanisms.
+```mermaid
+flowchart LR
+    subgraph Shutdown ["Graceful Shutdown (SIGTERM)"]
+        S1[Serialize HNSW graph] --> S2[Write gopher.index]
+        S3[Close WAL]
+    end
 
-**Index Persistence**
+    subgraph Startup ["Next Startup"]
+        T1{gopher.index exists?}
+        T1 -->|Yes| T2[Deserialize graph - zero rebuild cost]
+        T1 -->|No| T3[Replay WAL line by line]
+        T3 --> T4[Rebuild HNSW from scratch]
+    end
+```
 
-On a graceful shutdown triggered by `Ctrl+C` (SIGTERM), the engine serializes the complete HNSW graph — all nodes, their vector data, and every inter-node link across all layers — into `gopher.index` using Go's `encoding/gob`. On the next startup, this file is deserialized and the graph is restored to its exact prior state in RAM, with zero rebuild cost.
-
-**WAL-based Crash Recovery**
-
-If the process is killed hard and no valid `gopher.index` exists, the engine falls back to the WAL. It reads `gopher.wal` line by line and re-inserts every vector, fully rebuilding the HNSW graph from scratch. This guarantees durability at the cost of a slower cold-start in the crash scenario.
-
----
-
-### 5. The API Layer
-
-The HTTP API in `main.go` is the interface between the engine and the outside world.
-
-**Concurrency Model**
-
-All read operations (search, status) acquire a shared read lock via `sync.RWMutex`, allowing unlimited concurrent readers. Write operations (upsert) acquire the exclusive write lock, serializing mutations to both the Memtable and the HNSW graph. This means the server handles simultaneous search traffic from multiple clients without contention, while writes remain safe and consistent.
+On graceful shutdown triggered by `SIGTERM`, the complete HNSW graph — all nodes, vector data, and inter-node links across all layers — is serialized to `gopher.index`. On startup, if this file is valid, the graph is restored instantly. If the process was killed hard, the WAL provides full crash recovery by replaying every insert in sequence.
 
 ---
 
-## Reliability and Accuracy Validation
+### 6. Concurrency Model
 
-### The Recall Problem
+```
+Read operations  (Search, Status)  ──► sync.RWMutex.RLock()   ─► unlimited concurrent readers
+Write operations (Upsert, Delete)  ──► sync.RWMutex.Lock()    ─► serialized, safe mutation
+```
 
-HNSW is an **Approximate** Nearest Neighbor (ANN) algorithm. To achieve $O(\log N)$ search speeds, it takes shortcuts through the graph's layered hierarchy rather than exhaustively checking every node. While this makes search extremely fast, it introduces a mathematical risk: the algorithm may occasionally miss the single closest neighbor in favor of one that is nearly as close but reached faster through the graph structure.
+All HNSW operations and Memtable accesses are protected by `sync.RWMutex`. Read operations acquire a shared lock, allowing unlimited concurrent readers. Write operations acquire the exclusive lock, serializing mutations while reads continue on other goroutines.
 
-In production database systems, speed without a verified accuracy baseline is not acceptable. A search engine that returns wrong results quickly is worse than one that returns correct results slowly.
+---
 
-### Brute Force Search as Ground Truth
+### 7. Reliability and Accuracy Validation
 
-To quantify and validate the accuracy of the HNSW graph, GopherVectra exposes a `?method=brute` toggle on the `/search` endpoint. When this flag is set, the engine bypasses the graph entirely and performs a **flat scan** — computing the exact cosine similarity between the query vector and every vector stored in the system, then returning the mathematically perfect Top-K results. This serves as the ground truth against which the HNSW results are measured.
+HNSW is an **Approximate** Nearest Neighbor (ANN) algorithm. To quantify accuracy, the `/search` endpoint exposes a `?method=brute` toggle that bypasses the graph and performs a full flat scan — computing exact cosine similarity against every stored vector. This serves as ground truth.
 
-### Measuring Recall
-
-With both search paths available, recall can be measured directly:
+**Recall measurement:**
 
 $$Recall = \frac{| \text{Neighbors found by HNSW} \cap \text{Neighbors found by Brute Force} |}{K}$$
 
-As a concrete example: if you query for `K=5` neighbors and brute force returns `[A, B, C, D, E]` while HNSW returns `[A, B, X, D, E]`, the recall for that query is 80% — the graph found 4 of the 5 correct neighbors.
+Example: query for `K=5`, brute force returns `[A, B, C, D, E]`, HNSW returns `[A, B, X, D, E]` — recall is **80%**.
 
-### Current Performance
-
-During internal testing with 600+ 768-dimensional vectors, GopherVectra achieved a **recall accuracy of 100%**, validated by an automated Python test suite in `scripts/` that issues identical queries to both endpoints and compares the returned ID sets.
-
-This result confirms that the current HNSW parameters (`M=16`, `EfConstruction=50`) are well-tuned for high-precision retrieval at this dataset scale. The graph builds enough inter-node connections per layer that greedy traversal reliably reaches the true nearest neighbors without missing them.
-
-### Running the Validation
-```bash
-# Fast approximate search via HNSW graph
-curl -X POST http://localhost:8080/search \
-  -d '{"values": [...], "k": 5}'
-
-# Exact ground truth search via brute force flat scan
-curl -X POST "http://localhost:8080/search?method=brute" \
-  -d '{"values": [...], "k": 5}'
-```
-
-Compare the `id` fields across both responses to compute recall manually, or use the automated scripts in `scripts/` for bulk validation across a large query set.
+During internal testing with 600+ 768-dimensional vectors, GopherVectra achieved **100% recall** at `M=16`, `EfConstruction=50`.
 
 ---
 
 ## API Reference
 
-### Ingest Vector
+### `POST /upsert`
 
-**`POST /upsert`**
+Normalizes and indexes a vector. Written to WAL, inserted into HNSW graph, and buffered in the Memtable. Triggers an SSTable flush when the Memtable threshold is reached. If the RAM node limit (500) is reached, the oldest vector is evicted from the graph before insertion.
 
-Normalizes and indexes a vector. The vector is written to the WAL, inserted into the HNSW graph, and buffered in the Memtable. When the Memtable threshold is reached, it is automatically flushed to a Level 0 SSTable.
-
-Request body:
 ```json
+// Request
 {
-  "id": "vector_unique_id",
+  "id": "vec_001",
   "values": [0.1, -0.2, "... 768 floats"],
-  "metadata": {
-    "key": "value"
-  }
+  "metadata": { "source": "documents" }
 }
-```
 
-Response (`201 Created`):
-```json
-{
-  "status": "success",
-  "id": "vector_unique_id"
-}
+// Response 201
+{ "status": "success", "id": "vec_001" }
 ```
 
 ---
 
-### Search Neighbors
+### `POST /search`
 
-**`POST /search`**
+Traverses the HNSW graph and merges disk SSTable results to find the top `k` nearest neighbors. Append `?method=brute` for an exact flat scan.
 
-Traverses the HNSW graph to find the top `k` nearest neighbors. Pass `?method=brute` to bypass the graph and perform an exact flat scan instead.
-
-Request body:
 ```json
-{
-  "values": [0.1, -0.2, "... 768 floats"],
-  "k": 5
-}
-```
+// Request
+{ "values": [0.1, -0.2, "... 768 floats"], "k": 5 }
 
-Response:
-```json
+// Response
 [
-  {
-    "id": "vector_unique_id",
-    "score": 0.9871,
-    "metadata": {
-      "key": "value"
-    }
-  }
+  { "id": "vec_001", "score": 0.9871, "metadata": { "source": "documents" } },
+  { "id": "vec_043", "score": 0.9712, "metadata": {} }
 ]
 ```
 
 ---
 
-### Delete Vector
+### `DELETE /delete?id=<vector_id>`
 
-**`DELETE /delete?id=<vector_id>`**
+Soft-deletes a vector from the HNSW graph and writes a tombstone entry to the WAL and Memtable. The tombstone propagates to disk on the next flush and is purged on the next compaction pass.
 
-Removes a vector from the HNSW graph by its string ID. The engine resolves the string ID to its internal numeric identifier before performing the deletion.
-
-Response:
 ```json
-{
-  "status": "deleted",
-  "id": "vector_unique_id"
-}
+{ "status": "deleted", "id": "vec_001", "from_ram": true, "from_disk": false }
 ```
 
 ---
 
-### System Status
-
-**`GET /status`**
+### `GET /status`
 
 Returns real-time engine metrics including uptime, storage state, and HNSW graph internals.
 
-Response:
 ```json
 {
   "database_name": "GopherVectra",
   "uptime": "3m42s",
   "storage": {
     "vectors_in_ram": 12,
-    "total_vectors_idx": 1450
+    "max_ram_limit": 500,
+    "memtable_size": 8
   },
   "hnsw_metrics": {
     "max_layer": 4,
@@ -275,16 +361,33 @@ Response:
 
 ---
 
-## Development
+## Makefile
 
-### Setup & Run
+| Command          | Description                                      |
+|------------------|--------------------------------------------------|
+| `make run`       | Start the server via `go run main.go`            |
+| `make test-brute`| Run the Python recall validation suite           |
+| `make clean`     | Delete all `.wal`, `.index`, and `.db` files     |
+| `make status`    | `curl` the `/status` endpoint                    |
+
+---
+
+## Running the Validation
+
 ```bash
-go run main.go
+# Fast approximate search via HNSW graph
+curl -X POST http://localhost:8080/search \
+  -H "Content-Type: application/json" \
+  -d '{"values": [...], "k": 5}'
+
+# Exact ground truth search via brute force flat scan
+curl -X POST "http://localhost:8080/search?method=brute" \
+  -H "Content-Type: application/json" \
+  -d '{"values": [...], "k": 5}'
 ```
 
-### Clean Database
+Compare the `id` fields across both responses to compute recall manually, or run the automated suite:
 
-Resets the engine by removing all persisted state:
 ```bash
-rm gopher.wal gopher.index *.db
+make test-brute
 ```

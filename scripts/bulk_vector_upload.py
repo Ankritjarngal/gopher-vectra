@@ -4,7 +4,7 @@ import time
 
 # Configuration
 VECTRA_URL = "http://localhost:8080/upsert"
-TOTAL_VECTORS = 51
+TOTAL_VECTORS = 1000
 DIMENSIONS = 768  # Set this to 768 for Gemini or 3 for manual testing
 
 def generate_random_vector(dims):
