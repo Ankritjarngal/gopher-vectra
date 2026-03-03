@@ -14,11 +14,15 @@ import (
 
 var ActiveFilters = make(map[string]*bloom.Filter)
 
+var DataDir = "."
+
 type SSTable struct {
 	Path string
 }
 
-func Flush(entries map[string]*vector.Vector, path string) (*SSTable, error) {
+func Flush(entries map[string]*vector.Vector, filename string) (*SSTable, error) {
+	path := filepath.Join(DataDir, filename)
+
 	ids := make([]string, 0, len(entries))
 	for id := range entries {
 		ids = append(ids, id)
@@ -52,13 +56,16 @@ func Flush(entries map[string]*vector.Vector, path string) (*SSTable, error) {
 		binary.Write(f, binary.LittleEndian, uint32(len(v.Values)))
 		binary.Write(f, binary.LittleEndian, v.Values)
 	}
-	ActiveFilters[filepath.Base(path)] = bf
 
-	fmt.Printf("Successfully flushed %d vectors and created Bloom Filter for %s\n", len(entries), path)
+	ActiveFilters[filename] = bf
+
+	fmt.Printf("Flushed %d vectors to %s\n", len(entries), path)
 	return &SSTable{Path: path}, nil
 }
 
-func LoadSSTable(path string) (map[string]*vector.Vector, error) {
+func LoadSSTable(filename string) (map[string]*vector.Vector, error) {
+	path := filepath.Join(DataDir, filename)
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -99,17 +106,19 @@ func LoadSSTable(path string) (map[string]*vector.Vector, error) {
 		offset, _ = f.Seek(0, 1)
 	}
 
-	ActiveFilters[filepath.Base(path)] = bf
+	ActiveFilters[filename] = bf
 	return entries, nil
 }
 
 func ExistOnDisk(id string) bool {
-	files, _ := os.ReadDir(".")
+
+	files, _ := os.ReadDir(DataDir)
 	for _, f := range files {
-		if !f.IsDir() && strings.HasPrefix(f.Name(), "L") && filepath.Ext(f.Name()) == ".db" {
-			bf, exists := ActiveFilters[f.Name()]
+		name := f.Name()
+		if !f.IsDir() && strings.HasPrefix(name, "L") && filepath.Ext(name) == ".db" {
+			bf, exists := ActiveFilters[name]
 			if exists && bf.MightContain(id) {
-				entries, _ := LoadSSTable(f.Name())
+				entries, _ := LoadSSTable(name)
 				if vec, found := entries[id]; found {
 					if vec.Metadata != nil {
 						if _, deleted := vec.Metadata["tombstone"]; deleted {
@@ -125,7 +134,9 @@ func ExistOnDisk(id string) bool {
 }
 
 func SearchSSTable(filename string, query []float32, k int) ([]*vector.Vector, error) {
-	f, err := os.Open(filename)
+	path := filepath.Join(DataDir, filename)
+
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -175,11 +186,13 @@ func SearchSSTable(filename string, query []float32, k int) ([]*vector.Vector, e
 }
 
 func SearchAllDiskLevels(query []float32, k int) []*vector.Vector {
-	files, _ := os.ReadDir(".")
+
+	files, _ := os.ReadDir(DataDir)
 	var allDiskResults []*vector.Vector
 	for _, f := range files {
-		if !f.IsDir() && strings.HasPrefix(f.Name(), "L") && filepath.Ext(f.Name()) == ".db" {
-			results, err := SearchSSTable(f.Name(), query, k)
+		name := f.Name()
+		if !f.IsDir() && strings.HasPrefix(name, "L") && filepath.Ext(name) == ".db" {
+			results, err := SearchSSTable(name, query, k)
 			if err == nil {
 				allDiskResults = append(allDiskResults, results...)
 			}

@@ -2,3 +2,4 @@
 *.db
 gopher.index
 .env
+venv

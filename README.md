@@ -86,7 +86,7 @@ Write Request
          ▼                                  ▼
 ┌─────────────────────┐          ┌─────────────────────┐
 │  Memtable (RAM)     │          │  HNSW Graph (RAM)   │
-│  50-vector buffer   │          │  Probabilistic index│
+│  50-vector buffer   │          │  Probabilistic index │
 └────────┬────────────┘          └─────────────────────┘
          │ full?
          ▼
@@ -257,13 +257,15 @@ flowchart LR
 
     subgraph Startup ["Next Startup"]
         T1{gopher.index exists?}
-        T1 -->|Yes| T2[Deserialize graph - zero rebuild cost]
+        T1 -->|Yes| T2[Load graph + truncate WAL]
         T1 -->|No| T3[Replay WAL line by line]
         T3 --> T4[Rebuild HNSW from scratch]
     end
 ```
 
-On graceful shutdown triggered by `SIGTERM`, the complete HNSW graph — all nodes, vector data, and inter-node links across all layers — is serialized to `gopher.index`. On startup, if this file is valid, the graph is restored instantly. If the process was killed hard, the WAL provides full crash recovery by replaying every insert in sequence.
+On graceful shutdown triggered by `SIGTERM`, the complete HNSW graph — all nodes, vector data, and inter-node links across all layers — is written to `gopher.index` using raw binary encoding (`encoding/binary`). The format is self-contained: no WAL replay is needed to restore the graph.
+
+On the next startup, if `gopher.index` loads successfully, the WAL is immediately truncated to empty. The index is now the source of truth and the WAL starts fresh for the current session only. This keeps crash recovery fast — in the worst case the WAL holds at most one session of writes, not the entire history of the database. If the index file is absent or corrupt, the engine falls back to replaying the WAL from scratch.
 
 ---
 

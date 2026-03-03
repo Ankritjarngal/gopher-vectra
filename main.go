@@ -27,9 +27,20 @@ var (
 
 func main() {
 	startTime = time.Now()
-	var err error
 
-	wal, err = storage.NewWAL("gopher.wal")
+	if dir := os.Getenv("VECTRA_DATA_DIR"); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Fatalf("Cannot create data directory %s: %v", dir, err)
+		}
+		storage.DataDir = dir
+		fmt.Printf("Data directory: %s\n", dir)
+	}
+
+	walPath := fmt.Sprintf("%s/gopher.wal", storage.DataDir)
+	indexPath := fmt.Sprintf("%s/gopher.index", storage.DataDir)
+
+	var err error
+	wal, err = storage.NewWAL(walPath)
 	if err != nil {
 		log.Fatalf("Failed to open WAL: %v", err)
 	}
@@ -37,21 +48,35 @@ func main() {
 	index = engine.NewHNSW(16, 50)
 	memtable = storage.NewMemtable(50)
 
-	recovered, _ := wal.ReadALL()
-
-	if _, err := os.Stat("gopher.index"); err == nil {
-		if err := index.Load("gopher.index"); err != nil {
+	if _, err := os.Stat(indexPath); err == nil {
+		fmt.Println("Found index file, loading graph...")
+		if err := index.Load(indexPath); err != nil {
+			fmt.Printf("Index load failed (%v), falling back to WAL recovery\n", err)
+			recovered, _ := wal.ReadALL()
 			rebuildIndex(recovered)
 		} else {
-			for _, v := range recovered {
-				insertionOrder = append(insertionOrder, v.ID)
-				memtable.Put(v)
+			fmt.Printf("Graph restored from index (%d nodes)\n", len(index.Nodes))
+			if err := wal.Truncate(); err != nil {
+				fmt.Printf("Warning: failed to truncate WAL: %v\n", err)
+			} else {
+				fmt.Println("WAL truncated")
 			}
-			if memtable.Size() >= 50 {
-				memtable.Clear()
+
+			ids := make([]uint32, 0, len(index.Nodes))
+			for id := range index.Nodes {
+				ids = append(ids, id)
+			}
+			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+			for _, id := range ids {
+				node := index.Nodes[id]
+				if !node.Deleted {
+					insertionOrder = append(insertionOrder, node.Vector.ID)
+				}
 			}
 		}
 	} else {
+		fmt.Println("No index file found, replaying WAL...")
+		recovered, _ := wal.ReadALL()
 		rebuildIndex(recovered)
 	}
 
@@ -73,8 +98,10 @@ func main() {
 
 	go func() {
 		<-sigChan
-		fmt.Println("\nSaving index and shutting down")
-		index.Save("gopher.index")
+		fmt.Println("\nSaving index and shutting down...")
+		if err := index.Save(indexPath); err != nil {
+			fmt.Printf("Warning: failed to save index: %v\n", err)
+		}
 		wal.Close()
 		os.Exit(0)
 	}()
@@ -83,7 +110,7 @@ func main() {
 	if port == "" {
 		port = ":8080"
 	}
-	fmt.Printf("GopherVectra Listening on %s\n", port)
+	fmt.Printf("GopherVectra listening on %s\n", port)
 	log.Fatal(http.ListenAndServe(port, nil))
 }
 
@@ -122,7 +149,7 @@ func handleUpsert(w http.ResponseWriter, r *http.Request) {
 		victimID := insertionOrder[0]
 		if internalID, found := index.FindInternalID(victimID); found {
 			index.Delete(internalID)
-			fmt.Printf("Evicted %s from RAM (Memory Boundary Reached)\n", victimID)
+			fmt.Printf("Evicted %s from RAM (memory limit reached)\n", victimID)
 		}
 		insertionOrder = insertionOrder[1:]
 	}
@@ -163,45 +190,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	tempVec := &vector.Vector{Values: req.Values}
 	tempVec.Normalize()
 
-	ramResults := index.Search(tempVec.Values, req.K)
-	diskResults := storage.SearchAllDiskLevels(tempVec.Values, req.K)
-
-	uniqueResults := make(map[string]*vector.Vector)
-
-	for _, res := range ramResults {
-		if res == nil {
-			continue
-		}
-		sim, _ := vector.CosineSimilarity(tempVec.Values, res.Values)
-		res.Score = sim
-		uniqueResults[res.ID] = res
-	}
-
-	for _, res := range diskResults {
-		if res == nil {
-			continue
-		}
-		if existing, found := uniqueResults[res.ID]; found {
-			if res.Score > existing.Score {
-				uniqueResults[res.ID] = res
-			}
-		} else {
-			uniqueResults[res.ID] = res
-		}
-	}
-
-	var finalResults []*vector.Vector
-	for _, v := range uniqueResults {
-		finalResults = append(finalResults, v)
-	}
-
-	sort.Slice(finalResults, func(i, j int) bool {
-		return finalResults[i].Score > finalResults[j].Score
-	})
-
-	if len(finalResults) > req.K {
-		finalResults = finalResults[:req.K]
-	}
+	method := r.URL.Query().Get("method")
 
 	type resultDTO struct {
 		ID       string            `json:"id"`
@@ -210,12 +199,65 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var output []resultDTO
-	for _, res := range finalResults {
-		output = append(output, resultDTO{
-			ID:       res.ID,
-			Score:    res.Score,
-			Metadata: res.Metadata,
+
+	if method == "brute" {
+		nodes := index.BruteForceSearch(tempVec.Values, req.K)
+		for _, node := range nodes {
+			sim, _ := vector.CosineSimilarity(tempVec.Values, node.Vector.Values)
+			output = append(output, resultDTO{
+				ID:       node.Vector.ID,
+				Score:    sim,
+				Metadata: node.Vector.Metadata,
+			})
+		}
+	} else {
+		ramResults := index.Search(tempVec.Values, req.K)
+		diskResults := storage.SearchAllDiskLevels(tempVec.Values, req.K)
+
+		uniqueResults := make(map[string]*vector.Vector)
+
+		for _, res := range ramResults {
+			if res == nil {
+				continue
+			}
+			sim, _ := vector.CosineSimilarity(tempVec.Values, res.Values)
+			res.Score = sim
+			uniqueResults[res.ID] = res
+		}
+
+		for _, res := range diskResults {
+			if res == nil {
+				continue
+			}
+			if existing, found := uniqueResults[res.ID]; found {
+				if res.Score > existing.Score {
+					uniqueResults[res.ID] = res
+				}
+			} else {
+				uniqueResults[res.ID] = res
+			}
+		}
+
+		var finalResults []*vector.Vector
+		for _, v := range uniqueResults {
+			finalResults = append(finalResults, v)
+		}
+
+		sort.Slice(finalResults, func(i, j int) bool {
+			return finalResults[i].Score > finalResults[j].Score
 		})
+
+		if len(finalResults) > req.K {
+			finalResults = finalResults[:req.K]
+		}
+
+		for _, res := range finalResults {
+			output = append(output, resultDTO{
+				ID:       res.ID,
+				Score:    res.Score,
+				Metadata: res.Metadata,
+			})
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -231,6 +273,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 			"vectors_in_ram": totalVectors,
 			"max_ram_limit":  maxRamLimit,
 			"memtable_size":  memtable.Size(),
+			"data_dir":       storage.DataDir,
 		},
 		"hnsw_metrics": map[string]interface{}{
 			"max_layer":  index.CurrentMax,

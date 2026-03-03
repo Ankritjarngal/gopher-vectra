@@ -12,6 +12,7 @@ import (
 
 type WAL struct {
 	file *os.File
+	path string
 	mu   sync.Mutex
 }
 
@@ -20,7 +21,7 @@ func NewWAL(path string) (*WAL, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &WAL{file: f}, nil
+	return &WAL{file: f, path: path}, nil
 }
 
 func (w *WAL) Write(v *vector.Vector) error {
@@ -38,11 +39,25 @@ func (w *WAL) Write(v *vector.Vector) error {
 	w.file.Write(idBytes)
 	binary.Write(w.file, binary.LittleEndian, dimLen)
 	binary.Write(w.file, binary.LittleEndian, v.Values)
-	
 	binary.Write(w.file, binary.LittleEndian, metaLen)
 	w.file.Write(metaBytes)
 
 	return w.file.Sync()
+}
+
+func (w *WAL) Truncate() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err := w.file.Close(); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(w.path, os.O_TRUNC|os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	w.file = f
+	return nil
 }
 
 func (w *WAL) Close() error {
