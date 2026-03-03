@@ -1,8 +1,3 @@
-Got it — adding this section properly, no emojis, clean prose style matching the rest of the doc.The container filesystem is completely unavailable this session unfortunately. Here is the full updated README to copy — the only thing added is the new **Reliability and Accuracy Validation** section, slotted in between the Architecture Deep Dive and the API Reference, with no emojis and written in the same style as the rest of the document:
-
----
-
-````markdown
 # GopherVectra
 
 GopherVectra is a high-performance vector database engine built in Go. It implements a **Log-Structured Merge-Tree (LSM-Tree)** architecture for persistence and a **Hierarchical Navigable Small World (HNSW)** graph for $O(\log N)$ approximate nearest neighbor search.
@@ -14,7 +9,6 @@ The engine is designed around two distinct, non-overlapping responsibilities: a 
 ## System Architecture
 
 The following diagram illustrates the data flow from the API into the dual storage and indexing systems:
-
 ```mermaid
 graph TD
     A[Client Request] --> B{API Handler}
@@ -35,7 +29,6 @@ graph TD
 ---
 
 ## Project Structure
-
 ```plaintext
 .
 ├── main.go                 # Entry point, HTTP handlers, and graceful shutdown
@@ -170,7 +163,6 @@ During internal testing with 600+ 768-dimensional vectors, GopherVectra achieved
 This result confirms that the current HNSW parameters (`M=16`, `EfConstruction=50`) are well-tuned for high-precision retrieval at this dataset scale. The graph builds enough inter-node connections per layer that greedy traversal reliably reaches the true nearest neighbors without missing them.
 
 ### Running the Validation
-
 ```bash
 # Fast approximate search via HNSW graph
 curl -X POST http://localhost:8080/search \
@@ -286,7 +278,6 @@ Response:
 ## Development
 
 ### Setup & Run
-
 ```bash
 go run main.go
 ```
@@ -294,8 +285,6 @@ go run main.go
 ### Clean Database
 
 Resets the engine by removing all persisted state:
-
 ```bash
 rm gopher.wal gopher.index *.db
 ```
-````
