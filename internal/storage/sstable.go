@@ -90,3 +90,92 @@ func LoadSSTable(path string) (map[string]*vector.Vector, error) {
 
 	return entries, nil
 }
+
+func SearchSSTable(filename string, query []float32, k int) ([]*vector.Vector, error) {
+    f, err := os.Open(filename)
+    if err != nil {
+        return nil, err // File might not exist yet, that's okay
+    }
+    defer f.Close()
+
+    var results []*vector.Vector
+    fileInfo, _ := f.Stat()
+    size := fileInfo.Size()
+
+    var offset int64 = 0
+    // Binary loop reading exactly like LoadSSTable
+    for offset < size {
+        var idLen uint32
+        if err := binary.Read(f, binary.LittleEndian, &idLen); err != nil {
+            break 
+        }
+
+        idBytes := make([]byte, idLen)
+        if _, err := f.Read(idBytes); err != nil {
+            break
+        }
+        id := string(idBytes)
+
+        var vecLen uint32
+        if err := binary.Read(f, binary.LittleEndian, &vecLen); err != nil {
+            break
+        }
+
+        values := make([]float32, vecLen)
+        if err := binary.Read(f, binary.LittleEndian, &values); err != nil {
+            break
+        }
+
+        // Calculate similarity for this specific vector
+        sim, _ := vector.CosineSimilarity(query, values)
+        
+        // Create the vector object with the score populated
+        v := &vector.Vector{
+            ID:     id,
+            Values: values,
+            Score:  sim,
+        }
+        results = append(results, v)
+        
+        offset, _ = f.Seek(0, 1) // Advance offset tracker
+    }
+
+    // Sort the results from this specific file (Highest score first)
+    sort.Slice(results, func(i, j int) bool {
+        return results[i].Score > results[j].Score
+    })
+
+    // Trim to K if necessary
+    if len(results) > k {
+        return results[:k], nil
+    }
+    return results, nil
+}
+
+func SearchAllDiskLevels(query []float32, k int) []*vector.Vector {
+	files, _ := os.ReadDir(".")
+	var dbFiles []string
+	for _, f := range files {
+		if !f.IsDir() && (len(f.Name()) > 3 && f.Name()[len(f.Name())-3:] == ".db") {
+			dbFiles = append(dbFiles, f.Name())
+		}
+	}
+
+	var allDiskResults []*vector.Vector
+
+	for _, filename := range dbFiles {
+		results, err := SearchSSTable(filename, query, k)
+		if err == nil {
+			allDiskResults = append(allDiskResults, results...)
+		}
+	}
+
+	sort.Slice(allDiskResults, func(i, j int) bool {
+		return allDiskResults[i].Score > allDiskResults[j].Score
+	})
+
+	if len(allDiskResults) > k {
+		return allDiskResults[:k]
+	}
+	return allDiskResults
+}
