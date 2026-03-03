@@ -16,12 +16,14 @@ import (
 )
 
 var (
-	index    *engine.HNSW
-	wal      *storage.WAL
-	memtable *storage.Memtable
+	index     *engine.HNSW
+	wal       *storage.WAL
+	memtable  *storage.Memtable
+	startTime time.Time
 )
 
 func main() {
+	startTime = time.Now()
 	var err error
 	wal, err = storage.NewWAL("gopher.wal")
 	if err != nil {
@@ -29,39 +31,48 @@ func main() {
 	}
 
 	index = engine.NewHNSW(16, 50)
-	memtable = storage.NewMemtable(5)
+	memtable = storage.NewMemtable(50)
 
 	recovered, _ := wal.ReadALL()
 
 	if _, err := os.Stat("gopher.index"); err == nil {
-		for _, v := range recovered {
-			id := uint32(len(index.Nodes))
-			index.Nodes[id] = &engine.Node{ID: id, Vector: v}
-			memtable.Put(v)
-		}
 		if err := index.Load("gopher.index"); err != nil {
 			rebuildIndex(recovered)
+		} else {
+			for _, v := range recovered {
+				memtable.Put(v)
+			}
 		}
 	} else {
 		rebuildIndex(recovered)
 	}
 
+	go func() {
+		fmt.Println("Storage compactor started")
+		for {
+			time.Sleep(10 * time.Second)
+			storage.RunCompaction()
+		}
+	}()
+
 	http.HandleFunc("/upsert", handleUpsert)
 	http.HandleFunc("/search", handleSearch)
 	http.HandleFunc("/status", handleStatus)
+	http.HandleFunc("/delete", handleDelete)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		<-sigChan
+		fmt.Println("\nSaving index and shutting down")
 		index.Save("gopher.index")
 		wal.Close()
 		os.Exit(0)
 	}()
 
 	port := ":8080"
-	fmt.Printf("Listening on %s\n", port)
+	fmt.Printf("GopherVectra Listening on %s\n", port)
 	log.Fatal(http.ListenAndServe(port, nil))
 }
 
@@ -70,6 +81,7 @@ func rebuildIndex(vectors []*vector.Vector) {
 	index.CurrentMax = -1
 	memtable.Clear()
 	for _, v := range vectors {
+		v.Normalize()
 		index.Insert(v)
 		memtable.Put(v)
 	}
@@ -86,6 +98,9 @@ func handleUpsert(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
+
+	// Normalize vector before processing
+	v.Normalize()
 
 	wal.Write(&v)
 	index.Insert(&v)
@@ -119,7 +134,11 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := index.Search(req.Values, req.K)
+	// Normalize query vector
+	tempVec := &vector.Vector{Values: req.Values}
+	tempVec.Normalize()
+
+	results := index.Search(tempVec.Values, req.K)
 
 	type resultDTO struct {
 		ID       string            `json:"id"`
@@ -129,7 +148,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	var output []resultDTO
 	for _, res := range results {
-		sim, _ := vector.CosineSimilarity(req.Values, res.Values)
+		sim, _ := vector.CosineSimilarity(tempVec.Values, res.Values)
 		output = append(output, resultDTO{
 			ID:       res.ID,
 			Score:    sim,
@@ -142,11 +161,35 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
-	status := map[string]interface{}{
-		"vectors_count": len(index.Nodes),
-		"max_layer":     index.CurrentMax,
-		"entry_node":    index.EntryNode,
+	totalVectors := len(index.Nodes)
+	stats := map[string]interface{}{
+		"database_name": "GopherVectra",
+		"uptime":        time.Since(startTime).String(),
+		"storage": map[string]interface{}{
+			"vectors_in_ram":    memtable.Size(),
+			"total_vectors_idx": totalVectors,
+		},
+		"hnsw_metrics": map[string]interface{}{
+			"max_layer":  index.CurrentMax,
+			"entry_node": index.EntryNode,
+		},
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	json.NewEncoder(w).Encode(stats)
+}
+
+func handleDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Use DELETE", http.StatusMethodNotAllowed)
+		return
+	}
+	idStr := r.URL.Query().Get("id")
+	targetID, found := index.FindInternalID(idStr)
+	if !found {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	index.Delete(targetID)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status": "deleted", "id": "%s"}`, idStr)
 }

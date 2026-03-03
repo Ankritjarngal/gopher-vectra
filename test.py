@@ -1,34 +1,44 @@
 import requests
+import random
 import time
-import os
 
-URL = "http://localhost:8080/upsert"
-STATUS_URL = "http://localhost:8080/status"
+# Configuration
+VECTRA_URL = "http://localhost:8080/upsert"
+TOTAL_VECTORS = 600
+DIMENSIONS = 768  # Set this to 768 for Gemini or 3 for manual testing
 
-def check_db_files():
-    return [f for f in os.listdir('.') if f.endswith('.db')]
+def generate_random_vector(dims):
+    # Generates a list of random floats between -1.0 and 1.0
+    return [random.uniform(-1.0, 1.0) for _ in range(dims)]
 
-def test_flush():
-    print(f"Initial .db files: {check_db_files()}")
+def run_bulk_ingest():
+    print(f"Starting ingestion of {TOTAL_VECTORS} vectors...")
+    start_time = time.time()
     
-    for i in range(1, 7):
-        payload = {
-            "id": f"test_vec_{i}",
-            "values": [0.1 * i, 0.2, 0.3],
-            "metadata": {"info": f"vector number {i}"}
-        }
-        response = requests.post(URL, json=payload)
-        print(f"Inserted {i}/6: Status {response.status_code}")
+    for i in range(1, TOTAL_VECTORS + 1):
+        doc_id = f"auto_vec_{i}"
+        vector = generate_random_vector(DIMENSIONS)
         
-        if i == 5:
-            print("Next insert should trigger flush...")
+        payload = {
+            "id": doc_id,
+            "values": vector,
+            "metadata": {
+                "source": "automated_script",
+                "index": str(i),
+                "timestamp": str(time.time())
+            }
+        }
+        
+        try:
+            response = requests.post(VECTRA_URL, json=payload)
+            if i % 50 == 0:
+                print(f"Progress: {i}/{TOTAL_VECTORS} indexed...")
+        except Exception as e:
+            print(f"Error at index {i}: {e}")
+            break
             
-    time.sleep(1)
-    new_files = check_db_files()
-    if len(new_files) > 0:
-        print(f"Success! .db files found: {new_files}")
-    else:
-        print("No .db files found. Check if server console shows 'Flushed memtable'.")
+    end_time = time.time()
+    print(f"Finished! Total time: {end_time - start_time:.2f} seconds.")
 
 if __name__ == "__main__":
-    test_flush()
+    run_bulk_ingest()

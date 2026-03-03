@@ -229,3 +229,21 @@ func minInt(a, b int) int {
 	}
 	return b
 }
+
+func(h * HNSW) Delete(id uint32){
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.Nodes,id)
+}
+
+func (h *HNSW) FindInternalID(stringID string) (uint32, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for id, node := range h.Nodes {
+		if node.Vector.ID == stringID {
+			return id, true
+		}
+	}
+	return 0, false
+}

@@ -50,3 +50,9 @@ func (m * Memtable) GetEntries() map[string]*vector.Vector{
 	}
 	return copy
 }
+
+func(m * Memtable) Size()int{
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.entries)	
+}

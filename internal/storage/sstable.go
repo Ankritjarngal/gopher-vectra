@@ -47,3 +47,46 @@ func Flush(entries map[string]*vector.Vector,path string)(*SSTable,error){
 
 }
 
+func LoadSSTable(path string) (map[string]*vector.Vector, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	entries := make(map[string]*vector.Vector)
+	fileInfo, _ := f.Stat()
+	size := fileInfo.Size()
+
+	var offset int64 = 0
+	for offset < size {
+		var idLen uint32
+		if err := binary.Read(f, binary.LittleEndian, &idLen); err != nil {
+			break 
+		}
+
+		idBytes := make([]byte, idLen)
+		if _, err := f.Read(idBytes); err != nil {
+			return nil, err
+		}
+		id := string(idBytes)
+
+		var vecLen uint32
+		if err := binary.Read(f, binary.LittleEndian, &vecLen); err != nil {
+			return nil, err
+		}
+
+		values := make([]float32, vecLen)
+		if err := binary.Read(f, binary.LittleEndian, &values); err != nil {
+			return nil, err
+		}
+
+		entries[id] = &vector.Vector{
+			ID:     id,
+			Values: values,
+		}
+		offset, _ = f.Seek(0, 1)
+	}
+
+	return entries, nil
+}
