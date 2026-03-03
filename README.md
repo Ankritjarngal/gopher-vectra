@@ -1,45 +1,189 @@
 # GopherVectra
 
-GopherVectra is a high-performance vector database engine built in Go. It implements a **Log-Structured Merge-Tree (LSM-Tree)** architecture for persistent storage and a **Hierarchical Navigable Small World (HNSW)** graph for fast, approximate nearest neighbor search.
+GopherVectra is a high-performance vector database engine built in Go. It implements a **Log-Structured Merge-Tree (LSM-Tree)** architecture for persistence and a **Hierarchical Navigable Small World (HNSW)** graph for $O(\log N)$ approximate nearest neighbor search.
 
-
-
-## Core Engineering Features
-
-* **HNSW Indexing:** Multi-layered graph structure providing $O(\log N)$ search complexity.
-* **LSM-Tree Storage:** High-speed ingestion utilizing a Memtable and Write-Ahead Log (WAL).
-* **Background Compaction:** A dedicated "Janitor" goroutine that merges multiple Level 0 SSTables into optimized Level 1 storage files to reduce File Descriptor overhead.
-* **Distance Normalization:** Automatic scaling of 768D vectors to unit length (Magnitude = 1.0) to ensure stable Cosine Similarity.
-* **Dual-Mode Search:** Supports standard HNSW search and an exact Brute Force fallback for Recall (accuracy) validation.
+The engine is designed around two distinct, non-overlapping responsibilities: a **Write Path** that prioritizes durability and throughput, and a **Search Path** that prioritizes query speed in high-dimensional space. Understanding this separation is the key to understanding the entire codebase.
 
 ---
 
-## Technical Architecture
+## System Architecture
 
-### 1. The Write Path (Ingestion)
-1.  **Normalization:** Incoming vectors are normalized to a unit sphere.
-2.  **Durability (WAL):** Data is appended to `gopher.wal` before any RAM operations.
-3.  **Memtable:** Vectors are held in a RAM buffer (Default limit: 50).
-4.  **SSTable Flush:** When the Memtable is full, it flushes to a `level0_*.db` binary file.
+The following diagram illustrates the data flow from the API into the dual storage and indexing systems:
+```mermaid
+graph TD
+    A[Client Request] --> B{API Handler}
+    B -->|POST /upsert| C[Normalization Engine]
+    C --> D[Write Ahead Log - WAL]
+    C --> E[Memtable - RAM]
+    E -->|If Limit Reached| F[Flush to SSTable - Level 0]
+    F --> G[Background Compactor]
+    G -->|Merge 10x L0| H[SSTable - Level 1]
 
+    C --> I[HNSW Indexer]
+    I -->|Build Graph| J[RAM Search Index]
+    J -->|SIGTERM| K[gopher.index File]
 
-
-### 2. Storage Maintenance
-The **Compactor** monitors the storage directory. When it detects 10 or more Level 0 files, it performs a merge-sort operation to create a single Level 1 file, deleting the old segments to keep the search space clean.
-
-
-
-### 3. The Search Path
-The engine navigates the HNSW graph starting from the highest layer (coarse search) and moves down to Layer 0 (fine-grained search) to find the nearest neighbors.
+    B -->|POST /search| J
+```
 
 ---
 
-## API Documentation
+## Project Structure
+```plaintext
+.
+├── main.go                 # Entry point, HTTP handlers, and graceful shutdown
+├── go.mod                  # Module dependencies
+├── internal/
+│   ├── engine/             # HNSW graph construction, node management, and search traversal
+│   │   ├── hnsw.go
+│   │   └── persistence.go
+│   └── storage/            # LSM-Tree: WAL, Memtable, SSTable, and background Compactor
+│       ├── wal.go
+│       ├── memtable.go
+│       ├── sstable.go
+│       └── compactor.go
+├── pkg/
+│   └── vector/             # Vector math, cosine distance, and shared type definitions
+│       ├── distance.go
+│       └── types.go
+└── scripts/                # Python scripts for bulk ingestion and validation
+```
 
-### Upsert Vector
-**POST** `/upsert`
+---
+
+## Architecture Deep Dive
+
+### 1. The Write Path: LSM-Tree
+
+Traditional relational databases like MySQL use a B-Tree for storage, which requires random disk seeks to update records in place. GopherVectra instead uses an **LSM-Tree (Log-Structured Merge-Tree)**, which converts all random writes into fast, sequential disk operations. This is the same fundamental design used by LevelDB, RocksDB, and Apache Cassandra.
+
+**Step 1 — Normalization Engine**
+
+Before a vector ever touches disk or the graph, it passes through the normalization layer in `pkg/vector/distance.go`. The engine calculates the vector's magnitude across all 768 dimensions and scales each component so the resulting length is exactly 1.0, placing it on a unit sphere.
+
+This is not cosmetic. By normalizing first, every distance calculation in the HNSW graph is comparing the *angle* between two vectors rather than their raw magnitude. Cosine similarity, which measures semantic closeness, becomes mathematically equivalent to a simple dot product on unit vectors — cheaper to compute and consistent regardless of how the original embeddings were scaled.
+
+**Step 2 — Write-Ahead Log (WAL)**
+
+RAM is volatile. Before the vector is inserted into the in-memory buffer, it is immediately appended to `gopher.wal` on disk. This is a "safety first" operation: if the process crashes before the Memtable is flushed, the WAL guarantees no data is lost. On the next startup, the engine scans the WAL and replays every entry to reconstruct state.
+
+**Step 3 — Memtable (Active Write Buffer)**
+
+After the WAL write, the vector is inserted into the Memtable: a thread-safe Go map protected by a `sync.RWMutex`. This serves as the hot, in-RAM buffer for the most recently written data and allows for instant lookup of entries that have not yet been flushed to disk.
+
+**Step 4 — SSTable Flush**
+
+Once the Memtable reaches the configured threshold (50 vectors), it is flushed. The Go map is sorted by vector ID and written sequentially into an immutable binary `.db` file on disk — this is an **SSTable (Sorted String Table)**. Once written, these files are never modified. All updates and deletes are handled as new entries, with conflicts resolved during compaction.
+
+---
+
+### 2. The Maintenance Layer: Background Compaction
+
+Under sustained write load, the system would accumulate hundreds of small Level 0 `.db` files. This is problematic: the OS enforces a hard limit on open file descriptors per process, and scanning many small files for a read is far slower than scanning one large one.
+
+**The Compactor Goroutine**
+
+A background goroutine runs on a 10-second tick. It scans the working directory and counts the number of Level 0 SSTable files.
+
+**Merge-Sort and Deduplication**
+
+When 10 or more Level 0 files are detected, the Compactor reads all of them into memory, performs a merge-sort keyed on vector ID, and deduplicates — keeping only the most recently written version of any given ID. The result is written as a single, larger **Level 1** SSTable. The original Level 0 files are then deleted. This is the self-healing property of the engine: it continuously converges toward an optimal storage layout without any external intervention.
+
+---
+
+### 3. The Search Path: HNSW Graph
+
+Storing data is straightforward. Finding the closest vector in 768-dimensional space across millions of entries — in milliseconds — is the hard part. GopherVectra solves this with **HNSW (Hierarchical Navigable Small World)**, a graph-based approximate nearest neighbor algorithm implemented in `internal/engine/hnsw.go`.
+
+**Probabilistic Layer Assignment**
+
+When a vector is inserted into the graph, the engine samples from an exponential probability distribution to determine how many layers the node should occupy.
+
+- **Layer 0** contains every single vector in the dataset.
+- **Layer 1, 2, 3...** contain exponentially fewer vectors, acting as high-speed express lanes through the graph.
+
+A vector assigned to Layer 3, for example, also exists in Layers 2, 1, and 0. Most vectors only live in Layer 0.
+
+**Search Traversal**
+
+A query enters at the topmost layer, where the graph is sparse and nodes are far apart. The algorithm greedily navigates toward the query vector by always moving to whichever neighbor reduces the distance the most. When it can no longer improve at that layer, it drops down to the next denser layer and repeats. By the time traversal reaches Layer 0, the search has been guided to the correct neighborhood of the graph without ever scanning the full dataset.
+
+This hierarchy reduces search complexity from $O(N)$ — a brute-force full scan — to $O(\log N)$.
+
+---
+
+### 4. Persistence and Crash Recovery
+
+A database that loses its index on every restart is unusable in production. GopherVectra handles durability through two complementary mechanisms.
+
+**Index Persistence**
+
+On a graceful shutdown triggered by `Ctrl+C` (SIGTERM), the engine serializes the complete HNSW graph — all nodes, their vector data, and every inter-node link across all layers — into `gopher.index` using Go's `encoding/gob`. On the next startup, this file is deserialized and the graph is restored to its exact prior state in RAM, with zero rebuild cost.
+
+**WAL-based Crash Recovery**
+
+If the process is killed hard and no valid `gopher.index` exists, the engine falls back to the WAL. It reads `gopher.wal` line by line and re-inserts every vector, fully rebuilding the HNSW graph from scratch. This guarantees durability at the cost of a slower cold-start in the crash scenario.
+
+---
+
+### 5. The API Layer
+
+The HTTP API in `main.go` is the interface between the engine and the outside world.
+
+**Concurrency Model**
+
+All read operations (search, status) acquire a shared read lock via `sync.RWMutex`, allowing unlimited concurrent readers. Write operations (upsert) acquire the exclusive write lock, serializing mutations to both the Memtable and the HNSW graph. This means the server handles simultaneous search traffic from multiple clients without contention, while writes remain safe and consistent.
+
+---
+
+## API Reference
+
+### Ingest Vector
+
+**`POST /upsert`**
+
+Normalizes and indexes a vector. The vector is written to the WAL, inserted into the Memtable, and added as a node in the HNSW graph.
 ```json
 {
-  "id": "vector_01",
-  "values": [0.12, -0.05, ... 768 dimensions]
+  "id": "vector_unique_id",
+  "values": [0.1, -0.2, "... 768 floats"]
 }
+```
+
+### Search Neighbors
+
+**`POST /search`**
+
+Traverses the HNSW graph to find the top $K$ nearest neighbors to the query vector.
+```json
+{
+  "values": [0.1, -0.2, "..."],
+  "k": 5
+}
+```
+
+### System Status
+
+**`GET /status`**
+
+Returns real-time engine metrics.
+
+- `vectors_in_ram` — Current number of entries in the Memtable.
+- `total_vectors_idx` — Total nodes currently indexed in the HNSW graph.
+- `max_layer` — The highest layer currently present in the HNSW hierarchy.
+
+---
+
+## Development
+
+### Setup & Run
+```bash
+go run main.go
+```
+
+### Clean Database
+
+Resets the engine by removing all persisted state:
+```bash
+rm gopher.wal gopher.index *.db
+```
