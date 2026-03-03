@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -97,16 +98,16 @@ func (h *HNSW) Insert(v *vector.Vector) error {
 	for l := h.CurrentMax; l > targetLevel; l-- {
 		res := h.internalSearchLayer(v.Values, currObj, 1, l)
 		if len(res) > 0 {
-			currObj = res[0]
+			currObj = res[0].id
 		}
 	}
 
 	for l := minInt(targetLevel, h.CurrentMax); l >= 0; l-- {
 		neighbors := h.internalSearchLayer(v.Values, currObj, h.M, l)
 
-		for _, neighborID := range neighbors {
-			newNode.Neighbors[l] = append(newNode.Neighbors[l], neighborID)
-			if neighborNode, ok := h.Nodes[neighborID]; ok {
+		for _, item := range neighbors {
+			newNode.Neighbors[l] = append(newNode.Neighbors[l], item.id)
+			if neighborNode, ok := h.Nodes[item.id]; ok {
 				neighborNode.Neighbors[l] = append(neighborNode.Neighbors[l], nodeID)
 				if len(neighborNode.Neighbors[l]) > h.M {
 					neighborNode.Neighbors[l] = h.pruneNeighbors(neighborNode.Vector.Values, neighborNode.Neighbors[l], h.M)
@@ -119,7 +120,7 @@ func (h *HNSW) Insert(v *vector.Vector) error {
 		}
 
 		if len(neighbors) > 0 {
-			currObj = neighbors[0]
+			currObj = neighbors[0].id
 		}
 	}
 
@@ -195,52 +196,107 @@ func (h *HNSW) pruneNeighbors(base []float32, candidates []uint32, maxM int) []u
 	return selected
 }
 
-func (h *HNSW) internalSearchLayer(target []float32, entryNode uint32, ef int, level int) []uint32 {
+func (h *HNSW) internalSearchLayer(target []float32, entryNode uint32, ef int, level int) []heapItem {
+	entryNode_, ok := h.Nodes[entryNode]
+	if !ok {
+		return nil
+	}
+	entrySim, _ := vector.CosineSimilarity(target, entryNode_.Vector.Values)
+
 	visited := map[uint32]bool{entryNode: true}
-	candidates := []uint32{entryNode}
-	head := 0
-	foundNeighbors := []uint32{entryNode}
 
-	for head < len(candidates) {
-		currID := candidates[head]
-		head++
+	// candidates: min-heap — always explore the closest unvisited node first
+	candidates := &minHeap{{id: entryNode, sim: entrySim}}
+	heap.Init(candidates)
 
-		currNode, ok := h.Nodes[currID]
+	// results: max-heap — index 0 is always the worst result currently held
+	// so we can evict it in O(log ef) when a better candidate arrives
+	results := &worstHeap{{id: entryNode, sim: entrySim}}
+	heap.Init(results)
+
+	for candidates.Len() > 0 {
+		best := heap.Pop(candidates).(heapItem)
+
+		// the closest candidate we have not explored is worse than our worst
+		// current result — no further exploration can improve results
+		if results.Len() >= ef && best.sim < (*results)[0].sim {
+			break
+		}
+
+		currNode, ok := h.Nodes[best.id]
 		if !ok {
 			continue
 		}
-
 		if level >= len(currNode.Neighbors) {
 			continue
 		}
 
 		for _, neighborID := range currNode.Neighbors[level] {
-			if !visited[neighborID] {
-				visited[neighborID] = true
-				if _, exists := h.Nodes[neighborID]; exists {
-					foundNeighbors = append(foundNeighbors, neighborID)
-					candidates = append(candidates, neighborID)
+			if visited[neighborID] {
+				continue
+			}
+			visited[neighborID] = true
+
+			neighborNode, ok := h.Nodes[neighborID]
+			if !ok {
+				continue
+			}
+
+			sim, _ := vector.CosineSimilarity(target, neighborNode.Vector.Values)
+
+			// only add to results if we have room or this beats the worst result
+			if results.Len() < ef || sim > (*results)[0].sim {
+				heap.Push(candidates, heapItem{id: neighborID, sim: sim})
+				heap.Push(results, heapItem{id: neighborID, sim: sim})
+				if results.Len() > ef {
+					heap.Pop(results) // evict worst
 				}
 			}
 		}
-
-		sort.Slice(foundNeighbors, func(i, j int) bool {
-			nodeI := h.Nodes[foundNeighbors[i]]
-			nodeJ := h.Nodes[foundNeighbors[j]]
-			if nodeI == nil || nodeJ == nil {
-				return false
-			}
-			simI, _ := vector.CosineSimilarity(target, nodeI.Vector.Values)
-			simJ, _ := vector.CosineSimilarity(target, nodeJ.Vector.Values)
-			return simI > simJ
-		})
-
-		if len(foundNeighbors) > ef {
-			foundNeighbors = foundNeighbors[:ef]
-		}
 	}
-	return foundNeighbors
+
+	out := make([]heapItem, results.Len())
+	copy(out, *results)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].sim > out[j].sim
+	})
+	return out
 }
+
+type heapItem struct {
+	id  uint32
+	sim float64
+}
+
+type minHeap []heapItem
+
+func (h minHeap) Len() int            { return len(h) }
+func (h minHeap) Less(i, j int) bool  { return h[i].sim < h[j].sim }
+func (h minHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *minHeap) Push(x interface{}) { *h = append(*h, x.(heapItem)) }
+func (h *minHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+type worstHeap []heapItem
+
+func (h worstHeap) Len() int            { return len(h) }
+func (h worstHeap) Less(i, j int) bool  { return h[i].sim < h[j].sim }
+func (h worstHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *worstHeap) Push(x interface{}) { *h = append(*h, x.(heapItem)) }
+func (h *worstHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+
 
 func (h *HNSW) Search(query []float32, k int) []*vector.Vector {
 	h.mu.RLock()
@@ -254,15 +310,16 @@ func (h *HNSW) Search(query []float32, k int) []*vector.Vector {
 	for l := h.CurrentMax; l > 0; l-- {
 		res := h.internalSearchLayer(query, currObj, 1, l)
 		if len(res) > 0 {
-			currObj = res[0]
+			currObj = res[0].id
 		}
 	}
 
-	resultIDs := h.internalSearchLayer(query, currObj, h.Ef, 0)
-	results := make([]*vector.Vector, 0, len(resultIDs))
-	for _, id := range resultIDs {
-		node := h.Nodes[id]
+	items := h.internalSearchLayer(query, currObj, h.Ef, 0)
+	results := make([]*vector.Vector, 0, k)
+	for _, item := range items {
+		node := h.Nodes[item.id]
 		if node != nil && !node.Deleted {
+			node.Vector.Score = item.sim
 			results = append(results, node.Vector)
 		}
 		if len(results) >= k {

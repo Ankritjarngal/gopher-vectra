@@ -45,7 +45,7 @@ func main() {
 		log.Fatalf("Failed to open WAL: %v", err)
 	}
 
-	index = engine.NewHNSW(16, 50)
+	index = engine.NewHNSW(16,40)
 	memtable = storage.NewMemtable(50)
 
 	if _, err := os.Stat(indexPath); err == nil {

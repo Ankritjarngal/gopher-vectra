@@ -10,3 +10,9 @@ clean:
 
 status:
 	curl http://localhost:8080/status
+
+
+bulk:
+	python3 scripts/bulk_vector_upload.py
+indexdel:
+	rm -f *.index
