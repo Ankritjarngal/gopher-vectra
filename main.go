@@ -42,6 +42,9 @@ func main() {
 			for _, v := range recovered {
 				memtable.Put(v)
 			}
+			if memtable.Size() >= 50 {
+				memtable.Clear()
+			}
 		}
 	} else {
 		rebuildIndex(recovered)
@@ -80,10 +83,14 @@ func rebuildIndex(vectors []*vector.Vector) {
 	index.Nodes = make(map[uint32]*engine.Node)
 	index.CurrentMax = -1
 	memtable.Clear()
+	
+	fmt.Printf("Recovering %d vectors...\n", len(vectors))
 	for _, v := range vectors {
-		v.Normalize()
 		index.Insert(v)
 		memtable.Put(v)
+	}
+	if memtable.Size() >= 50 {
+		memtable.Clear()
 	}
 }
 
@@ -99,7 +106,6 @@ func handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Normalize vector before processing
 	v.Normalize()
 
 	wal.Write(&v)
@@ -123,6 +129,8 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	method := r.URL.Query().Get("method")
+
 	type searchReq struct {
 		Values []float32 `json:"values"`
 		K      int       `json:"k"`
@@ -134,11 +142,20 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Normalize query vector
 	tempVec := &vector.Vector{Values: req.Values}
 	tempVec.Normalize()
 
-	results := index.Search(tempVec.Values, req.K)
+	var finalResults []*vector.Vector
+
+	if method == "brute" {
+		fmt.Println("Executing Brute Force Search")
+		nodes := index.BruteForceSearch(tempVec.Values, req.K)
+		for _, n := range nodes {
+			finalResults = append(finalResults, n.Vector)
+		}
+	} else {
+		finalResults = index.Search(tempVec.Values, req.K)
+	}
 
 	type resultDTO struct {
 		ID       string            `json:"id"`
@@ -147,7 +164,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var output []resultDTO
-	for _, res := range results {
+	for _, res := range finalResults {
 		sim, _ := vector.CosineSimilarity(tempVec.Values, res.Values)
 		output = append(output, resultDTO{
 			ID:       res.ID,

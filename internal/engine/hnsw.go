@@ -247,3 +247,38 @@ func (h *HNSW) FindInternalID(stringID string) (uint32, bool) {
 	}
 	return 0, false
 }
+
+func (h *HNSW) BruteForceSearch(query []float32, k int) []*Node {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	type distanceResult struct {
+		node *Node
+		dist float32 
+	}
+
+	var allDistances []distanceResult
+
+	for _, node := range h.Nodes {
+		sim, _ := vector.CosineSimilarity(query, node.Vector.Values)
+				allDistances = append(allDistances, distanceResult{
+			node: node,
+			dist: float32(sim), 
+		})
+	}
+
+	sort.Slice(allDistances, func(i, j int) bool {
+		return allDistances[i].dist > allDistances[j].dist
+	})
+
+	if len(allDistances) < k {
+		k = len(allDistances)
+	}
+
+	results := make([]*Node, k)
+	for i := 0; i < k; i++ {
+		results[i] = allDistances[i].node
+	}
+
+	return results
+}
