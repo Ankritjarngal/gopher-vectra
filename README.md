@@ -142,35 +142,95 @@ All read operations (search, status) acquire a shared read lock via `sync.RWMute
 
 **`POST /upsert`**
 
-Normalizes and indexes a vector. The vector is written to the WAL, inserted into the Memtable, and added as a node in the HNSW graph.
+Normalizes and indexes a vector. The vector is written to the WAL, inserted into the HNSW graph, and buffered in the Memtable. When the Memtable threshold is reached, it is automatically flushed to a Level 0 SSTable.
+
+Request body:
 ```json
 {
   "id": "vector_unique_id",
-  "values": [0.1, -0.2, "... 768 floats"]
+  "values": [0.1, -0.2, "... 768 floats"],
+  "metadata": {
+    "key": "value"
+  }
 }
 ```
+
+Response (`201 Created`):
+```json
+{
+  "status": "success",
+  "id": "vector_unique_id"
+}
+```
+
+---
 
 ### Search Neighbors
 
 **`POST /search`**
 
-Traverses the HNSW graph to find the top $K$ nearest neighbors to the query vector.
+Normalizes the query vector and traverses the HNSW graph to find the top `k` nearest neighbors. Each result includes its cosine similarity score and any metadata stored at insertion time.
+
+Request body:
 ```json
 {
-  "values": [0.1, -0.2, "..."],
+  "values": [0.1, -0.2, "... 768 floats"],
   "k": 5
 }
 ```
+
+Response:
+```json
+[
+  {
+    "id": "vector_unique_id",
+    "score": 0.9871,
+    "metadata": {
+      "key": "value"
+    }
+  }
+]
+```
+
+---
+
+### Delete Vector
+
+**`DELETE /delete?id=<vector_id>`**
+
+Removes a vector from the HNSW graph by its string ID. The engine resolves the string ID to its internal numeric identifier before performing the deletion.
+
+Response:
+```json
+{
+  "status": "deleted",
+  "id": "vector_unique_id"
+}
+```
+
+---
 
 ### System Status
 
 **`GET /status`**
 
-Returns real-time engine metrics.
+Returns real-time engine metrics including uptime, storage state, and HNSW graph internals.
 
-- `vectors_in_ram` — Current number of entries in the Memtable.
-- `total_vectors_idx` — Total nodes currently indexed in the HNSW graph.
-- `max_layer` — The highest layer currently present in the HNSW hierarchy.
+Response:
+```json
+{
+  "database_name": "GopherVectra",
+  "uptime": "3m42s",
+  "storage": {
+    "vectors_in_ram": 12,
+    "total_vectors_idx": 1450
+  },
+  "hnsw_metrics": {
+    "max_layer": 4,
+    "entry_node": 0
+  }
+}
+```
 
 ---
 
