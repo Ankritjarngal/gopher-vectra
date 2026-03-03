@@ -74,7 +74,10 @@ func main() {
 		os.Exit(0)
 	}()
 
-	port := ":8080"
+	port := os.Getenv("VECTRA_PORT")
+if port == "" {
+    port = ":8080"
+}
 	fmt.Printf("GopherVectra Listening on %s\n", port)
 	log.Fatal(http.ListenAndServe(port, nil))
 }
