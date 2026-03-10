@@ -182,6 +182,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req searchReq
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
