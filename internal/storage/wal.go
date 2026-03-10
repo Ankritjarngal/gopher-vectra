@@ -92,7 +92,7 @@ func (w *WAL) ReadALL() ([]*vector.Vector, error) {
 
 		var metaLen uint32
 		if err := binary.Read(w.file, binary.LittleEndian, &metaLen); err != nil {
-			return nil, err
+			return nil, err		
 		}
 
 		metaBytes := make([]byte, metaLen)
