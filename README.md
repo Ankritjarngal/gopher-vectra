@@ -86,7 +86,7 @@ Write Request
          ▼                                  ▼
 ┌─────────────────────┐          ┌─────────────────────┐
 │  Memtable (RAM)     │          │  HNSW Graph (RAM)   │
-│  50-vector buffer   │          │  Probabilistic index │
+│  50-vector buffer   │          │  Probabilistic index│
 └────────┬────────────┘          └─────────────────────┘
          │ full?
          ▼
