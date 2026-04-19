@@ -45,7 +45,7 @@ func main() {
 		log.Fatalf("Failed to open WAL: %v", err)
 	}
 
-	index = engine.NewHNSW(16,40)
+	index = engine.NewHNSW(16,80)
 	memtable = storage.NewMemtable(50)
 
 	if _, err := os.Stat(indexPath); err == nil {
@@ -142,9 +142,7 @@ func handleUpsert(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
-
 	v.Normalize()
-
 	if len(index.Nodes) >= maxRamLimit && len(insertionOrder) > 0 {
 		victimID := insertionOrder[0]
 		if internalID, found := index.FindInternalID(victimID); found {
@@ -259,6 +257,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 				Metadata: res.Metadata,
 			})
 		}
+		fmt.Printf("Search Query Vector (First 3): %v\n", req.Values[:3])
 	}
 
 	w.Header().Set("Content-Type", "application/json")
