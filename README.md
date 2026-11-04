@@ -294,40 +294,6 @@ During testing with 1000 768-dimensional vectors, GopherVectra achieved **100% r
 
 ---
 
-## Benchmark Results
-
-Tested on a ZenBook (Intel amd64, AVX2+FMA) with 1000 vectors of 768 dimensions, 10 concurrent users, 500 queries after a 50-query warmup.
-
-| Parameter | Value |
-|-----------|-------|
-| Vectors | 1000 |
-| Dimensions | 768 |
-| M | 16 |
-| Ef | 40 |
-| Concurrent users | 10 |
-
-| Metric | Result |
-|--------|--------|
-| Throughput | 39.74 QPS |
-| Avg Latency | 247.49 ms |
-| Median Latency | 244.26 ms |
-| P95 Latency | 305.02 ms |
-| P99 Latency | 355.51 ms |
-| Min / Max | 154.22 ms / 371.69 ms |
-| Success Rate | 100% |
-| Recall Accuracy | 100% |
-
-**Optimization history** — all improvements made to the same codebase:
-
-| Stage | QPS | Avg Latency | Recall |
-|-------|-----|-------------|--------|
-| Baseline (sort on every iteration) | 5 | 2000 ms | 100% |
-| Two-heap search traversal | 18 | 527 ms | 100% |
-| Eliminated redundant dot products | 31 | 315 ms | 100% |
-| Simplified scalar dot product | 39 | 247 ms | 100% |
-
----
-
 ## API Reference
 
 ### `POST /upsert`
